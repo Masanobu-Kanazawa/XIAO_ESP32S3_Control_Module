@@ -1,22 +1,21 @@
 // XIAO ESP32S3 Sense - Integrated Control Module
 // Features:
 //  - SBUS receive (R3008SB) on Serial1 (inverted, 100k 8E2)
-//  - STS3032 servo control (TX only) on UART2
-//  - PWM servo output via LEDC
+//  - MG92B PWM servo control in microseconds on the former STS connector
 //  - Ultrasonic distance sensor (M5Stack Unit Ultrasonic-IO / RCWL-9620)
-//  - HX711 load cell read (bit-bang)
+//  - ADS1015 differential voltage read via the IMU I2C bus
 //  - IMU (AE-LSM6DSV16X) via I2C
 //  - GPS (SparkFun GP-808G) via UART NMEA
 //  - microSD logging (CSV) on Sense expansion board
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_ADS1X15.h>
 
 #include "sbus_module.h"
 #include "ultrasonic_rcwl9620.h"
 #include "hx711_bitbang.h"
 #include "imu_lsm6dsv16x.h"
+#include "ads1015_module.h"
 #include "gps_gp808g.h"
 #include "pwm_servo_module.h"
 #include "sts3032_module.h"
@@ -26,8 +25,8 @@
 // Feature toggles
 // -----------------------------
 #define USE_SBUS            1
-#define USE_STS3032         1
-#define USE_PWM_SERVO       0
+#define USE_STS3032         0
+#define USE_PWM_SERVO       1
 #define USE_ULTRASONIC_IO   1
 #define USE_HX711           0
 #define USE_IMU_LSM6DSV16X  1
@@ -42,7 +41,7 @@
 static constexpr int PIN_SBUS_RX      = 44;   // D7
 static constexpr int PIN_SBUS_TX_DMY  = -1;   // unused
 static constexpr int PIN_STS_TX       = 43;   // D6 (TX only)
-static constexpr int PIN_PWM_SERVO    = 3;    // D2
+static constexpr int PIN_PWM_SERVO    = 43;   // D6 (former STS3032 signal pin)
 static constexpr int PIN_ULTRA_SDA    = 1;    // D0
 static constexpr int PIN_ULTRA_SCL    = 2;    // D1
 static constexpr int PIN_GPS_RX       = 4;    // D3 (GP-808G TX/white)
@@ -102,13 +101,8 @@ hx711_bitbang::State g_hx{};
 imu_lsm6dsv16x::State g_imu{};
 #endif
 
-// The ADS1015 is wired in parallel with the IMU on Wire (D4/D5). AIN0-AIN1
-// is logged as a voltage until its force-conversion coefficient is available.
 #if USE_ADS1015
-Adafruit_ADS1015 g_ads{};
-static bool g_adsReady = false;
-static int16_t g_adsRaw = 0;
-static float g_adsDiffVolts = NAN;
+ads1015_module::State g_ads{};
 #endif
 
 #if USE_GPS_GP808G
@@ -141,85 +135,66 @@ static constexpr uint32_t ULTRA_I2C_POLL_MS = 5;          // requestFrom polling
 static constexpr bool ULTRA_I2C_DEBUG = false; // request count/raw debug prints are intentionally off
 static constexpr uint32_t DEBUG_PRINT_INTERVAL_MS = 500;  // reduce serial-print overhead
 static constexpr uint32_t HX711_TARE_DURATION_MS = 3000;  // tare sampling window
-static constexpr uint32_t ADS1015_SAMPLE_INTERVAL_MS = 8; // 128 SPS = 7.8125 ms/conversion
-static uint32_t g_lastAdsSampleMs = 0;
 
 // -----------------------------
 // Ultrasonic mix settings
 // -----------------------------
-// PWM servo: SBUS CH[1]-based command.
-// STS servo:
+// MG92B servo:
 //  - CH8 fixed-mode side: fixed angle selected by CH5 three-position switch.
-//  - otherwise: ultrasonic command when available; fixed to base(2000) when ultrasonic is disabled.
+//  - otherwise: ultrasonic command when available; neutral when ultrasonic is disabled.
 // Mapping direction:
-//  - STS command uses ultrasonic range 20..30cm only.
+//  - The command uses ultrasonic range 20..30cm only.
 static constexpr float ULTRA_NEAR_CM = 20.0f;
 static constexpr float ULTRA_FAR_CM = 30.0f;
 
-// PWM servo from SBUS CH[1]:
-//  - 368  -> 160 deg
-//  - 1014 -> 90 deg (neutral)
-//  - 1680 -> 20 deg
-static constexpr uint16_t PWM_SBUS_CH1_MIN = 368;
-static constexpr uint16_t PWM_SBUS_CH1_NEUTRAL = 1014;
-static constexpr uint16_t PWM_SBUS_CH1_MAX = 1680;
-static constexpr int PWM_SBUS_NEUTRAL_DEG = 90;
-static constexpr int PWM_SBUS_TRAVEL_DEG = 70;
-// STS: keep 10cm -> 5deg sensitivity, centered at position 2000.
-// Final command is clamped to 1700..2400.
-static constexpr float STS_ULTRA_DEG_PER_10CM = 5.0f;
-static constexpr float STS_MAX_DEG = 300.0f;               // 0..300deg corresponds to 0..4000
-static constexpr float STS_POS_PER_DEG = 4000.0f / STS_MAX_DEG;
-static constexpr int STS_POS_BASE = 2000;                  // neutral / baseline position
-static constexpr int STS_POS_MIN = 1700;                   // command lower limit
-static constexpr int STS_POS_MAX = 2400;                   // command upper limit
-static constexpr uint8_t STS_MODE_CH8_INDEX = 7;           // CH8
-static constexpr uint8_t STS_FIXED_LEVEL_CH5_INDEX = 4;    // CH5
-static constexpr bool STS_FIXED_MODE_CH8_IS_HIGH = true;   // true: CH8 upper side enables fixed mode
-static constexpr float STS_FIXED_DEG_LOW = 0.0f;           // CH5 low
-static constexpr float STS_FIXED_DEG_MID = 3.3f;           // CH5 mid
-static constexpr float STS_FIXED_DEG_HIGH = 5.7f;          // CH5 high
+// MG92B published range: 700..2300us corresponds to about 150deg.
+// Treat the old STS angle command as an offset from the 1500us neutral point.
+// Adjust these constants after measuring the actual linkage and safe travel.
+static constexpr uint16_t MG92B_MIN_US = 700;
+static constexpr uint16_t MG92B_NEUTRAL_US = 1500;
+static constexpr uint16_t MG92B_MAX_US = 2300;
+static constexpr float MG92B_RANGE_DEG = 150.0f;
+static constexpr float MG92B_US_PER_DEG =
+  (float)(MG92B_MAX_US - MG92B_MIN_US) / MG92B_RANGE_DEG;
+static constexpr bool MG92B_REVERSE = false;
 
-inline int stsPositionFromDeg(float deg) {
-  const float pos = STS_POS_BASE + deg * STS_POS_PER_DEG;
-  return constrain((int)pos, STS_POS_MIN, STS_POS_MAX);
+// Preserve the former STS control behavior.
+static constexpr float SERVO_ULTRA_DEG_PER_10CM = 5.0f;
+static constexpr uint8_t SERVO_MODE_CH8_INDEX = 7;           // CH8
+static constexpr uint8_t SERVO_FIXED_LEVEL_CH5_INDEX = 4;    // CH5
+static constexpr bool SERVO_FIXED_MODE_CH8_IS_HIGH = true;   // true: CH8 upper side enables fixed mode
+static constexpr float SERVO_FIXED_DEG_LOW = 0.0f;           // CH5 low
+static constexpr float SERVO_FIXED_DEG_MID = 3.3f;           // CH5 mid
+static constexpr float SERVO_FIXED_DEG_HIGH = 5.7f;          // CH5 high
+
+static float g_mg92bCommandDeg = 0.0f;
+static uint16_t g_mg92bTargetUs = MG92B_NEUTRAL_US;
+
+inline uint16_t mg92bPulseFromAngleOffset(float deg) {
+  const float signed_deg = MG92B_REVERSE ? -deg : deg;
+  const float pulse_us = (float)MG92B_NEUTRAL_US + signed_deg * MG92B_US_PER_DEG;
+  return (uint16_t)constrain((int)lroundf(pulse_us), (int)MG92B_MIN_US, (int)MG92B_MAX_US);
 }
 
-inline float stsFixedDegFromCh5(uint16_t ch5_value) {
+inline float servoFixedDegFromCh5(uint16_t ch5_value) {
   const sbus::ThreePos sw = sbus::threePosFromValue(ch5_value);
-  if (sw == sbus::ThreePos::Low) return STS_FIXED_DEG_LOW;
-  if (sw == sbus::ThreePos::High) return STS_FIXED_DEG_HIGH;
-  return STS_FIXED_DEG_MID;
+  if (sw == sbus::ThreePos::Low) return SERVO_FIXED_DEG_LOW;
+  if (sw == sbus::ThreePos::High) return SERVO_FIXED_DEG_HIGH;
+  return SERVO_FIXED_DEG_MID;
 }
 
-inline bool stsFixedModeFromCh8(uint16_t ch8_value) {
+inline bool servoFixedModeFromCh8(uint16_t ch8_value) {
   const sbus::ThreePos sw = sbus::threePosFromValue(ch8_value);
-  if (STS_FIXED_MODE_CH8_IS_HIGH) {
+  if (SERVO_FIXED_MODE_CH8_IS_HIGH) {
     return sw == sbus::ThreePos::High;
   }
   return sw == sbus::ThreePos::Low;
 }
 
-inline int stsPositionFromUltraCm(float cm) {
-  if (isnan(cm) || cm <= 0.0f) return STS_POS_BASE;
+inline float servoDegFromUltraCm(float cm) {
+  if (isnan(cm) || cm <= 0.0f) return 0.0f;
   const float cm_clamped = constrain(cm, ULTRA_NEAR_CM, ULTRA_FAR_CM);
-  const float deg = (cm_clamped / 10.0f) * STS_ULTRA_DEG_PER_10CM;
-  const float pos = STS_POS_BASE + deg * STS_POS_PER_DEG;
-  return constrain((int)pos, STS_POS_MIN, STS_POS_MAX);
-}
-
-inline int pwmServoDegFromSbusCh1(uint16_t v) {
-  if (v <= PWM_SBUS_CH1_NEUTRAL) {
-    const float t = (float)(constrain((int)v, (int)PWM_SBUS_CH1_MIN, (int)PWM_SBUS_CH1_NEUTRAL) - PWM_SBUS_CH1_MIN) /
-                    (float)(PWM_SBUS_CH1_NEUTRAL - PWM_SBUS_CH1_MIN);
-    const float deg = (float)(PWM_SBUS_NEUTRAL_DEG + PWM_SBUS_TRAVEL_DEG) - t * (float)PWM_SBUS_TRAVEL_DEG;
-    return constrain((int)deg, 0, 180);
-  }
-
-  const float t = (float)(constrain((int)v, (int)PWM_SBUS_CH1_NEUTRAL, (int)PWM_SBUS_CH1_MAX) - PWM_SBUS_CH1_NEUTRAL) /
-                  (float)(PWM_SBUS_CH1_MAX - PWM_SBUS_CH1_NEUTRAL);
-  const float deg = (float)PWM_SBUS_NEUTRAL_DEG - t * (float)PWM_SBUS_TRAVEL_DEG;
-  return constrain((int)deg, 0, 180);
+  return (cm_clamped / 10.0f) * SERVO_ULTRA_DEG_PER_10CM;
 }
 
 #if USE_GPS_GP808G
@@ -335,12 +310,9 @@ void setup() {
 #endif
 
 #if USE_ADS1015
-  g_adsReady = g_ads.begin(0x48, &Wire);
-  if (!g_adsReady) {
+  if (!ads1015_module::init(Wire, g_ads)) {
     Serial.println("[ADS1015] not found at 0x48");
   } else {
-    g_ads.setGain(GAIN_SIXTEEN);             // differential full scale: +/-0.256 V
-    g_ads.setDataRate(RATE_ADS1015_128SPS); // conversion period: 7.8125 ms
     Serial.println("[ADS1015] AIN0-AIN1 differential init @128SPS, gain x16");
   }
 #endif
@@ -378,11 +350,16 @@ void setup() {
 #endif
 
 #if USE_PWM_SERVO
-  g_pwmReady = pwm_servo::init(PIN_PWM_SERVO, 90);
+  g_pwmReady = pwm_servo::initUs(
+    PIN_PWM_SERVO,
+    MG92B_NEUTRAL_US,
+    MG92B_MIN_US,
+    MG92B_MAX_US
+  );
   if (g_pwmReady) {
-    Serial.println("[PWM] servo init");
+    Serial.println("[MG92B] PWM init on former STS pin, neutral=1500us");
   } else {
-    Serial.println("[PWM] servo init FAILED");
+    Serial.println("[MG92B] PWM init FAILED");
   }
 #endif
 
@@ -449,36 +426,29 @@ void loop() {
 #endif
 
 #if USE_ADS1015
-  if (g_adsReady && now - g_lastAdsSampleMs >= ADS1015_SAMPLE_INTERVAL_MS) {
-    g_lastAdsSampleMs = now;
-    g_adsRaw = g_ads.readADC_Differential_0_1();
-    g_adsDiffVolts = g_ads.computeVolts(g_adsRaw);
-  }
+  ads1015_module::poll(Wire, g_ads, now);
 #endif
 
-#if USE_PWM_SERVO && USE_SBUS
-  if (g_pwmReady && sbusFrameUpdated) {
-    const int servo_deg = pwmServoDegFromSbusCh1(g_sbus.ch[1]);
-    pwm_servo::writeDeg(servo_deg);
-  }
-#endif
-
-#if USE_STS3032
-  int sts_pos = STS_POS_BASE;
-  bool use_fixed_sts = false;
+#if USE_PWM_SERVO
+  bool use_fixed_servo = false;
 #if USE_SBUS
-  use_fixed_sts = stsFixedModeFromCh8(g_sbus.ch[STS_MODE_CH8_INDEX]);
+  use_fixed_servo = servoFixedModeFromCh8(g_sbus.ch[SERVO_MODE_CH8_INDEX]);
 #endif
-  if (use_fixed_sts) {
+  if (use_fixed_servo) {
 #if USE_SBUS
-    sts_pos = stsPositionFromDeg(stsFixedDegFromCh5(g_sbus.ch[STS_FIXED_LEVEL_CH5_INDEX]));
+    g_mg92bCommandDeg = servoFixedDegFromCh5(g_sbus.ch[SERVO_FIXED_LEVEL_CH5_INDEX]);
 #endif
   } else {
 #if USE_ULTRASONIC_IO
-    sts_pos = stsPositionFromUltraCm(g_ultra.cm);
+    g_mg92bCommandDeg = servoDegFromUltraCm(g_ultra.cm);
+#else
+    g_mg92bCommandDeg = 0.0f;
 #endif
   }
-  sts3032::sendGoalPosition(SerialSTS, 1, (uint16_t)sts_pos, 0, 0);
+  g_mg92bTargetUs = mg92bPulseFromAngleOffset(g_mg92bCommandDeg);
+  if (g_pwmReady) {
+    pwm_servo::writeUs(g_mg92bTargetUs);
+  }
 #endif
 
 #if USE_SD_LOGGING && USE_SBUS
@@ -544,7 +514,7 @@ void loop() {
 #endif
 
 #if USE_ADS1015
-    row.ads_diff_v = g_adsDiffVolts;
+    row.ads_diff_v = g_ads.diff_volts;
 #endif
 
 #if USE_IMU_LSM6DSV16X
@@ -632,11 +602,18 @@ void loop() {
 
 #if USE_ADS1015
     Serial.print(" ads_a0_a1_v=");
-    if (g_adsReady) {
-      Serial.print(g_adsDiffVolts, 6);
+    if (g_ads.present) {
+      Serial.print(g_ads.diff_volts, 6);
     } else {
       Serial.print("N/A");
     }
+#endif
+
+#if USE_PWM_SERVO
+    Serial.print(" mg92b_deg=");
+    Serial.print(g_mg92bCommandDeg, 2);
+    Serial.print(" us=");
+    Serial.print(g_mg92bTargetUs);
 #endif
 
 #if USE_IMU_LSM6DSV16X
