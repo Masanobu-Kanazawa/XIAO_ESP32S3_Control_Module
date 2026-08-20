@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Adafruit_ADS1X15.h>
 
 #include "sbus_module.h"
 #include "ultrasonic_rcwl9620.h"
@@ -28,8 +29,9 @@
 #define USE_STS3032         1
 #define USE_PWM_SERVO       0
 #define USE_ULTRASONIC_IO   1
-#define USE_HX711           1
-#define USE_IMU_LSM6DSV16X  0
+#define USE_HX711           0
+#define USE_IMU_LSM6DSV16X  1
+#define USE_ADS1015         1
 #define USE_GPS_GP808G      1
 #define USE_SD_LOGGING      1
 #define GPS_USE_SOFTWARE_SERIAL 1
@@ -100,6 +102,15 @@ hx711_bitbang::State g_hx{};
 imu_lsm6dsv16x::State g_imu{};
 #endif
 
+// The ADS1015 is wired in parallel with the IMU on Wire (D4/D5). AIN0-AIN1
+// is logged as a voltage until its force-conversion coefficient is available.
+#if USE_ADS1015
+Adafruit_ADS1015 g_ads{};
+static bool g_adsReady = false;
+static int16_t g_adsRaw = 0;
+static float g_adsDiffVolts = NAN;
+#endif
+
 #if USE_GPS_GP808G
 #if GPS_USE_SOFTWARE_SERIAL
 #include <SoftwareSerial.h>
@@ -130,6 +141,8 @@ static constexpr uint32_t ULTRA_I2C_POLL_MS = 5;          // requestFrom polling
 static constexpr bool ULTRA_I2C_DEBUG = false; // request count/raw debug prints are intentionally off
 static constexpr uint32_t DEBUG_PRINT_INTERVAL_MS = 500;  // reduce serial-print overhead
 static constexpr uint32_t HX711_TARE_DURATION_MS = 3000;  // tare sampling window
+static constexpr uint32_t ADS1015_SAMPLE_INTERVAL_MS = 8; // 128 SPS = 7.8125 ms/conversion
+static uint32_t g_lastAdsSampleMs = 0;
 
 // -----------------------------
 // Ultrasonic mix settings
@@ -287,7 +300,7 @@ void setup() {
   Serial.println();
   Serial.println("=== XIAO ESP32S3 Sense Control Module ===");
 
-#if USE_IMU_LSM6DSV16X
+#if USE_IMU_LSM6DSV16X || USE_ADS1015
 #if USE_HX711
   if (PIN_IMU_SDA == PIN_HX711_DOUT || PIN_IMU_SDA == PIN_HX711_SCK ||
       PIN_IMU_SCL == PIN_HX711_DOUT || PIN_IMU_SCL == PIN_HX711_SCK) {
@@ -300,7 +313,9 @@ void setup() {
     Wire.begin();
   }
   Wire.setClock(IMU_I2C_HZ);
+#endif
 
+#if USE_IMU_LSM6DSV16X
   if (!imu_lsm6dsv16x::detectAndInit(Wire, g_imu)) {
     if (g_imu.addr == 0) {
       Serial.println("[IMU] LSM6DSV16X not found");
@@ -316,6 +331,17 @@ void setup() {
     Serial.print(g_imu.addr, HEX);
     Serial.print(" who=0x");
     Serial.println(g_imu.whoami, HEX);
+  }
+#endif
+
+#if USE_ADS1015
+  g_adsReady = g_ads.begin(0x48, &Wire);
+  if (!g_adsReady) {
+    Serial.println("[ADS1015] not found at 0x48");
+  } else {
+    g_ads.setGain(GAIN_SIXTEEN);             // differential full scale: +/-0.256 V
+    g_ads.setDataRate(RATE_ADS1015_128SPS); // conversion period: 7.8125 ms
+    Serial.println("[ADS1015] AIN0-AIN1 differential init @128SPS, gain x16");
   }
 #endif
 
@@ -422,6 +448,14 @@ void loop() {
   imu_lsm6dsv16x::poll(Wire, g_imu, now, 10);
 #endif
 
+#if USE_ADS1015
+  if (g_adsReady && now - g_lastAdsSampleMs >= ADS1015_SAMPLE_INTERVAL_MS) {
+    g_lastAdsSampleMs = now;
+    g_adsRaw = g_ads.readADC_Differential_0_1();
+    g_adsDiffVolts = g_ads.computeVolts(g_adsRaw);
+  }
+#endif
+
 #if USE_PWM_SERVO && USE_SBUS
   if (g_pwmReady && sbusFrameUpdated) {
     const int servo_deg = pwmServoDegFromSbusCh1(g_sbus.ch[1]);
@@ -509,9 +543,8 @@ void loop() {
     row.ultra_cm = g_ultra.cm;
 #endif
 
-#if USE_HX711
-    row.hx_g = g_hx.gram;
-    row.hx_raw = g_hx.raw;
+#if USE_ADS1015
+    row.ads_diff_v = g_adsDiffVolts;
 #endif
 
 #if USE_IMU_LSM6DSV16X
@@ -595,6 +628,15 @@ void loop() {
     Serial.print(g_hx.gram, 2);
     Serial.print(" hx_raw=");
     Serial.print(g_hx.raw);
+#endif
+
+#if USE_ADS1015
+    Serial.print(" ads_a0_a1_v=");
+    if (g_adsReady) {
+      Serial.print(g_adsDiffVolts, 6);
+    } else {
+      Serial.print("N/A");
+    }
 #endif
 
 #if USE_IMU_LSM6DSV16X

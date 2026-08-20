@@ -13,8 +13,7 @@ struct Row {
   const uint16_t* sbus_ch{nullptr};
   uint32_t ultra_us{0};
   float ultra_cm{NAN};
-  float hx_g{NAN};
-  long hx_raw{LONG_MIN};
+  float ads_diff_v{NAN};
   float imu_ax{NAN};
   float imu_ay{NAN};
   float imu_az{NAN};
@@ -134,7 +133,7 @@ inline bool open(Logger& logger) {
     return false;
   }
 
-  logger.file.println("ms,sbus_ch0,sbus_ch1,sbus_ch2,sbus_ch3,sbus_ch4,sbus_ch5,ultra_us,ultra_cm,hx_g,hx_raw,imu_ax,imu_ay,imu_az,imu_gx,imu_gy,imu_gz,gps_fix,gps_sats,gps_utc,gps_date,gps_year,gps_month,gps_day,gps_hour,gps_minute,gps_second,gps_centisecond,gps_hdop,gps_lat,gps_lon,gps_alt_m,gps_speed_mps,gps_course_deg");
+  logger.file.println("ms,sbus_ch0,sbus_ch1,sbus_ch2,sbus_ch3,sbus_ch4,sbus_ch5,ultra_us,ultra_cm,ads_a0_a1_v,imu_ax,imu_ay,imu_az,imu_gx,imu_gy,imu_gz,gps_fix,gps_sats,gps_utc,gps_date,gps_year,gps_month,gps_day,gps_hour,gps_minute,gps_second,gps_centisecond,gps_hdop,gps_lat,gps_lon,gps_alt_m,gps_speed_mps,gps_course_deg");
   logger.file.flush();
   Serial.print("[SD] logging to ");
   Serial.println(name);
@@ -152,10 +151,10 @@ inline void writeRow(Logger& logger, const Row& row) {
 
   char line[560];
   snprintf(line, sizeof(line),
-           "%lu,%u,%u,%u,%u,%u,%u,%lu,%.2f,%.2f,%ld,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%d,%s,%s,%d,%d,%d,%d,%d,%d,%d,%.2f,%.7f,%.7f,%.2f,%.3f,%.2f",
+           "%lu,%u,%u,%u,%u,%u,%u,%lu,%.2f,%.6f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%d,%s,%s,%d,%d,%d,%d,%d,%d,%d,%.2f,%.7f,%.7f,%.2f,%.3f,%.2f",
            (unsigned long)row.ms,
            row.sbus_ch[0], row.sbus_ch[1], row.sbus_ch[2], row.sbus_ch[3], row.sbus_ch[4], row.sbus_ch[5],
-           (unsigned long)row.ultra_us, row.ultra_cm, row.hx_g, row.hx_raw,
+           (unsigned long)row.ultra_us, row.ultra_cm, row.ads_diff_v,
            row.imu_ax, row.imu_ay, row.imu_az, row.imu_gx, row.imu_gy, row.imu_gz,
            row.gps_fix, row.gps_sats, row.gps_utc, row.gps_date,
            row.gps_year, row.gps_month, row.gps_day, row.gps_hour, row.gps_minute, row.gps_second, row.gps_centisecond,
