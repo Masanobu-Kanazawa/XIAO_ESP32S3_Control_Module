@@ -1,8 +1,9 @@
 // XIAO ESP32S3 Sense - Integrated Control Module
 // Features:
 //  - SBUS receive (R3008SB) on Serial1 (inverted, 100k 8E2)
-//  - MG92B PWM servo control in microseconds on the former STS connector
-//  - Ultrasonic distance sensor (M5Stack Unit Ultrasonic-IO / RCWL-9620)
+//  - PWM servo 1 on D2, controlled from SBUS
+//  - MG92B PWM servo 2 on D6, preserving the former STS behavior
+//  - Ultrasonic distance sensor (M5Stack Unit Ultrasonic-IO, trig/echo, interrupt-driven)
 //  - ADS1015 differential voltage read via the IMU I2C bus
 //  - IMU (AE-LSM6DSV16X) via I2C
 //  - GPS (SparkFun GP-808G) via UART NMEA
@@ -12,7 +13,7 @@
 #include <Wire.h>
 
 #include "sbus_module.h"
-#include "ultrasonic_rcwl9620.h"
+#include "ultrasonic_io.h"
 #include "hx711_bitbang.h"
 #include "imu_lsm6dsv16x.h"
 #include "ads1015_module.h"
@@ -41,9 +42,10 @@
 static constexpr int PIN_SBUS_RX      = 44;   // D7
 static constexpr int PIN_SBUS_TX_DMY  = -1;   // unused
 static constexpr int PIN_STS_TX       = 43;   // D6 (TX only)
-static constexpr int PIN_PWM_SERVO    = 43;   // D6 (former STS3032 signal pin)
-static constexpr int PIN_ULTRA_SDA    = 1;    // D0
-static constexpr int PIN_ULTRA_SCL    = 2;    // D1
+static constexpr int PIN_PWM_SERVO1   = 3;    // D2 (original PWM servo)
+static constexpr int PIN_PWM_SERVO2   = 43;   // D6 (former STS3032 signal pin)
+static constexpr int PIN_ULTRA_TRIG   = 1;    // D0
+static constexpr int PIN_ULTRA_ECHO   = 2;    // D1
 static constexpr int PIN_GPS_RX       = 4;    // D3 (GP-808G TX/white)
 static constexpr int PIN_GPS_TX_DMY   = -1;   // unused
 // Sense expansion board extra pins:
@@ -76,11 +78,14 @@ static HardwareSerial& SerialSTS = Serial2;
 #endif
 
 #if USE_PWM_SERVO
-static bool g_pwmReady = false;
+static pwm_servo::Channel g_pwmServo1;
+static pwm_servo::Channel g_pwmServo2;
+static bool g_pwmServo1Ready = false;
+static bool g_pwmServo2Ready = false;
 #endif
 
 #if USE_ULTRASONIC_IO
-ultra_rcwl9620::State g_ultra{};
+ultra_io::State g_ultra{};
 #endif
 
 #if USE_HX711
@@ -129,16 +134,26 @@ static uint32_t g_lastLoopRateMs = 0;
 static uint32_t g_loopCount = 0;
 static uint32_t g_loopHz = 0;
 static constexpr uint32_t LOG_INTERVAL_MS = 100; // 10 Hz
-static constexpr uint32_t ULTRA_POLL_INTERVAL_MS = 70;    // sensor conversion is ~50-70ms in practice
-static constexpr uint32_t ULTRA_I2C_TIMEOUT_MS = 90;      // cap blocking on failure path
-static constexpr uint32_t ULTRA_I2C_POLL_MS = 5;          // requestFrom polling interval
-static constexpr bool ULTRA_I2C_DEBUG = false; // request count/raw debug prints are intentionally off
+// Trig/echo guard interval. 30ms (~33Hz) worked on the bench but dropped
+// readings in the assembled module, so back off to 45ms (~22Hz) for margin
+// against burst reverberation. Raise toward 60ms if misses persist.
+static constexpr uint32_t ULTRA_POLL_INTERVAL_MS = 45;
 static constexpr uint32_t DEBUG_PRINT_INTERVAL_MS = 500;  // reduce serial-print overhead
 static constexpr uint32_t HX711_TARE_DURATION_MS = 3000;  // tare sampling window
 
 // -----------------------------
 // Ultrasonic mix settings
 // -----------------------------
+// PWM servo 1 from SBUS channel array index 1:
+//  - 368  -> 160 deg
+//  - 1014 -> 90 deg (neutral)
+//  - 1680 -> 20 deg
+static constexpr uint16_t PWM1_SBUS_MIN = 368;
+static constexpr uint16_t PWM1_SBUS_NEUTRAL = 1014;
+static constexpr uint16_t PWM1_SBUS_MAX = 1680;
+static constexpr int PWM1_NEUTRAL_DEG = 90;
+static constexpr int PWM1_TRAVEL_DEG = 70;
+
 // MG92B servo:
 //  - CH8 fixed-mode side: fixed angle selected by CH5 three-position switch.
 //  - otherwise: ultrasonic command when available; neutral when ultrasonic is disabled.
@@ -160,8 +175,8 @@ static constexpr bool MG92B_REVERSE = false;
 
 // Preserve the former STS control behavior.
 static constexpr float SERVO_ULTRA_DEG_PER_10CM = 5.0f;
-static constexpr uint8_t SERVO_MODE_CH8_INDEX = 7;           // CH8
-static constexpr uint8_t SERVO_FIXED_LEVEL_CH5_INDEX = 4;    // CH5
+static constexpr uint8_t SERVO_MODE_CH8_INDEX = 8;           // confirmed: 9th value in SBUS CH() log (2-pos switch, 144/1904)
+static constexpr uint8_t SERVO_FIXED_LEVEL_CH5_INDEX = 5;    // CH5 (confirmed: 6th value in SBUS CH() log)
 static constexpr bool SERVO_FIXED_MODE_CH8_IS_HIGH = true;   // true: CH8 upper side enables fixed mode
 static constexpr float SERVO_FIXED_DEG_LOW = 0.0f;           // CH5 low
 static constexpr float SERVO_FIXED_DEG_MID = 3.3f;           // CH5 mid
@@ -169,6 +184,35 @@ static constexpr float SERVO_FIXED_DEG_HIGH = 5.7f;          // CH5 high
 
 static float g_mg92bCommandDeg = 0.0f;
 static uint16_t g_mg92bTargetUs = MG92B_NEUTRAL_US;
+
+// TEMP bench-test switch: force MG92B to sweep continuously, ignoring
+// SBUS CH8/CH5 and the ultrasonic sensor entirely. Set to 0 to restore
+// normal SBUS/ultrasonic-driven control.
+#define MG92B_DEBUG_FORCE_SWEEP 0
+static constexpr float MG92B_SWEEP_RANGE_DEG = 30.0f;   // sweeps -range..+range
+static constexpr uint32_t MG92B_SWEEP_PERIOD_MS = 4000; // full back-and-forth period
+
+inline float mg92bSweepDeg(uint32_t now) {
+  const float t = (float)(now % MG92B_SWEEP_PERIOD_MS) / (float)MG92B_SWEEP_PERIOD_MS;
+  const float tri = (t < 0.5f) ? (t * 2.0f) : (2.0f - t * 2.0f); // 0 -> 1 -> 0
+  return -MG92B_SWEEP_RANGE_DEG + tri * (2.0f * MG92B_SWEEP_RANGE_DEG);
+}
+
+inline int pwmServo1DegFromSbus(uint16_t v) {
+  if (v <= PWM1_SBUS_NEUTRAL) {
+    const float t =
+      (float)(constrain((int)v, (int)PWM1_SBUS_MIN, (int)PWM1_SBUS_NEUTRAL) - PWM1_SBUS_MIN) /
+      (float)(PWM1_SBUS_NEUTRAL - PWM1_SBUS_MIN);
+    const float deg = (float)(PWM1_NEUTRAL_DEG + PWM1_TRAVEL_DEG) - t * (float)PWM1_TRAVEL_DEG;
+    return constrain((int)deg, 0, 180);
+  }
+
+  const float t =
+    (float)(constrain((int)v, (int)PWM1_SBUS_NEUTRAL, (int)PWM1_SBUS_MAX) - PWM1_SBUS_NEUTRAL) /
+    (float)(PWM1_SBUS_MAX - PWM1_SBUS_NEUTRAL);
+  const float deg = (float)PWM1_NEUTRAL_DEG - t * (float)PWM1_TRAVEL_DEG;
+  return constrain((int)deg, 0, 180);
+}
 
 inline uint16_t mg92bPulseFromAngleOffset(float deg) {
   const float signed_deg = MG92B_REVERSE ? -deg : deg;
@@ -350,22 +394,35 @@ void setup() {
 #endif
 
 #if USE_PWM_SERVO
-  g_pwmReady = pwm_servo::initUs(
-    PIN_PWM_SERVO,
+  g_pwmServo1Ready = g_pwmServo1.init(PIN_PWM_SERVO1, PWM1_NEUTRAL_DEG);
+  if (g_pwmServo1Ready) {
+    Serial.println("[SERVO1] PWM init on D2/GPIO3");
+  } else {
+    Serial.println("[SERVO1] PWM init FAILED");
+  }
+
+  g_pwmServo2Ready = g_pwmServo2.initUs(
+    PIN_PWM_SERVO2,
     MG92B_NEUTRAL_US,
     MG92B_MIN_US,
     MG92B_MAX_US
   );
-  if (g_pwmReady) {
-    Serial.println("[MG92B] PWM init on former STS pin, neutral=1500us");
+  if (g_pwmServo2Ready) {
+    Serial.println("[SERVO2/MG92B] PWM init on former STS D6/GPIO43, neutral=1500us");
   } else {
-    Serial.println("[MG92B] PWM init FAILED");
+    Serial.println("[SERVO2/MG92B] PWM init FAILED");
   }
 #endif
 
 #if USE_ULTRASONIC_IO
-  ultra_rcwl9620::initPins(PIN_ULTRA_SDA, PIN_ULTRA_SCL, 100000);
-  Serial.println("[ULTRA] I2C init (Wire1 addr=0x57)");
+  if (ultra_io::initPins(PIN_ULTRA_TRIG, PIN_ULTRA_ECHO)) {
+    Serial.print("[ULTRA] trig/echo init TRIG=GPIO");
+    Serial.print(PIN_ULTRA_TRIG);
+    Serial.print(" ECHO=GPIO");
+    Serial.println(PIN_ULTRA_ECHO);
+  } else {
+    Serial.println("[ULTRA] trig/echo init FAILED");
+  }
 #endif
 
 #if USE_HX711
@@ -414,7 +471,7 @@ void loop() {
 #endif
 
 #if USE_ULTRASONIC_IO
-  ultra_rcwl9620::poll(g_ultra, now, ULTRA_POLL_INTERVAL_MS, ULTRA_I2C_TIMEOUT_MS, ULTRA_I2C_POLL_MS, ULTRA_I2C_DEBUG);
+  ultra_io::poll(g_ultra, now, ULTRA_POLL_INTERVAL_MS);
 #endif
 
 #if USE_HX711
@@ -430,6 +487,15 @@ void loop() {
 #endif
 
 #if USE_PWM_SERVO
+  if (g_pwmServo1Ready && sbusFrameUpdated) {
+#if USE_SBUS
+    g_pwmServo1.writeDeg(pwmServo1DegFromSbus(g_sbus.ch[1]));
+#endif
+  }
+
+#if MG92B_DEBUG_FORCE_SWEEP
+  g_mg92bCommandDeg = mg92bSweepDeg(now);
+#else
   bool use_fixed_servo = false;
 #if USE_SBUS
   use_fixed_servo = servoFixedModeFromCh8(g_sbus.ch[SERVO_MODE_CH8_INDEX]);
@@ -445,9 +511,10 @@ void loop() {
     g_mg92bCommandDeg = 0.0f;
 #endif
   }
+#endif
   g_mg92bTargetUs = mg92bPulseFromAngleOffset(g_mg92bCommandDeg);
-  if (g_pwmReady) {
-    pwm_servo::writeUs(g_mg92bTargetUs);
+  if (g_pwmServo2Ready) {
+    g_pwmServo2.writeUs(g_mg92bTargetUs);
   }
 #endif
 
@@ -587,10 +654,24 @@ void loop() {
 #endif
 
 #if USE_ULTRASONIC_IO
-    Serial.print(" ultra_raw=");
+    Serial.print(" ultra_us=");
     Serial.print(g_ultra.duration_us);
     Serial.print(" cm=");
-    Serial.print(g_ultra.cm, 1);
+    if (g_ultra.valid) {
+      Serial.print(g_ultra.cm, 1);
+    } else {
+      Serial.print("N/A");
+    }
+    Serial.print(" raw=");
+    if (isnan(g_ultra.raw_cm)) {
+      Serial.print("miss");
+    } else {
+      Serial.print(g_ultra.raw_cm, 1);
+    }
+    Serial.print(" age_ms=");
+    Serial.print(now - g_ultra.last_valid_ms);
+    Serial.print(" err=");
+    Serial.print(g_ultra.last_error);
 #endif
 
 #if USE_HX711
